@@ -16,3 +16,7 @@ Users only need to paste a phone number. IMSI, session, and cell assignment are 
 git clone https://github.com/semb-commits/core-net-lite
 cd core-net-lite
 python3 core-tool.py
+pkg update && pkg install python
+git clone https://github.com/semb-commits/core-net-lite
+cd core-net-lite
+python core-tool.py
