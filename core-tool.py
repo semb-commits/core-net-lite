@@ -26,8 +26,14 @@ BASE_COORDS = {
     "Semarang": (-6.9667, 110.4167)
 }
 
-MCC_MNC = "51010" # Default, bakal di-override pas startup
-K_KEY = "1234567890ABCDEF1234567890ABCDEF" # Dummy Ki key
+STREET_NAMES = ["Sudirman", "Thamrin", "Gatot Subroto", "Merdeka", "Diponegoro", "Ahmad Yani",
+                "Siliwangi", "Soekarno Hatta", "Kenjeran", "Basuki Rahmat", "Pemuda", "Pandanaran"]
+
+KELURAHAN = ["Kel. Kebon Sirih", "Kel. Cikini", "Kel. Menteng", "Kel. Dago", "Kel. Tegallega",
+             "Kel. Gubeng", "Kel. Genteng", "Kel. Medan Petisah", "Kel. Candisari"]
+
+MCC_MNC = "51010"
+K_KEY = "1234567890ABCDEF1234567890ABCDEF"
 
 def loading(msg="Processing"):
     print(f"{msg}", end="", flush=True)
@@ -58,6 +64,9 @@ def init_db():
         cell_id TEXT PRIMARY KEY,
         city TEXT NOT NULL,
         location TEXT NOT NULL,
+        address TEXT NOT NULL,
+        sector INTEGER NOT NULL,
+        azimuth INTEGER NOT NULL,
         tac TEXT NOT NULL,
         latitude REAL,
         longitude REAL
@@ -88,18 +97,38 @@ def seed_cells_kota(kota="Jakarta", n=150):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     c.execute("DELETE FROM cell WHERE city =?", (kota,))
+
     cells = []
-    for i in range(1, n+1):
-        cell_id = f"{kota[:3].upper()}{i:03d}"
-        lat = round(lat0 + random.uniform(-0.15, 0.15), 4)
-        lon = round(lon0 + random.uniform(-0.15, 0.15), 4)
+    site_count = n // 3 # 1 site = 3 sektor
+
+    for i in range(1, site_count + 1):
+        site_lat = round(lat0 + random.uniform(-0.15, 0.15), 4)
+        site_lon = round(lon0 + random.uniform(-0.15, 0.15), 4)
+        street = random.choice(STREET_NAMES)
+        kelurahan = random.choice(KELURAHAN)
+        address = f"Jl. {street}, {kelurahan}, {kota}"
         tac = f"01{random.randint(0xA0, 0xFF):X}"
-        location = f"{kota} Area {i}"
-        cells.append((cell_id, kota, location, tac, lat, lon))
-    c.executemany("INSERT INTO cell VALUES (?,?,?,?,?,?)", cells)
+
+        # 3 sektor per site
+        for sector_num, azimuth in enumerate([0, 120, 240], 1):
+            cell_id = f"{kota[:3].upper()}{i:03d}S{sector_num}"
+            location = f"{kota} Site {i:03d}"
+
+            # Kasih offset kecil biar koordinat sektor gak numpuk
+            lat = round(site_lat + random.uniform(-0.002, 0.002), 4)
+            lon = round(site_lon + random.uniform(-0.002, 0.002), 4)
+
+            cells.append((cell_id, kota, location, address, sector_num, azimuth, tac, lat, lon))
+
+            if len(cells) >= n:
+                break
+        if len(cells) >= n:
+            break
+
+    c.executemany("INSERT INTO cell VALUES (?,?,?,?,?)", cells)
     conn.commit()
     conn.close()
-    print(f"[+] {n} cell untuk {kota} berhasil di-generate")
+    print(f"[+] {len(cells)} cell untuk {kota} berhasil di-generate")
 
 def generate_imsi(msisdn):
     return MCC_MNC + msisdn[-8:]
@@ -126,20 +155,13 @@ def nas_auth_procedure(imsi, ki):
     print("\n--- NAS Authentication Procedure ---")
     rand = format(random.getrandbits(128), '032x').upper()
     xres, kasme = milenage(ki, rand)
-
-    print_s1ap_log("downlinkNASTransport",
-                   NAS_Message="Authentication Request",
-                   RAND=rand)
-
+    print_s1ap_log("downlinkNASTransport", NAS_Message="Authentication Request", RAND=rand)
     res = input("Masukkan RES [enter untuk auto-OK]: ").strip()
     if not res:
         res = xres
-
     if res == xres:
         print("[+] Authentication Success")
-        print_s1ap_log("uplinkNASTransport",
-                       NAS_Message="Authentication Response",
-                       RES=res)
+        print_s1ap_log("uplinkNASTransport", NAS_Message="Authentication Response", RES=res)
         return rand, xres, kasme
     else:
         print("[-] Authentication Failed")
@@ -147,13 +169,9 @@ def nas_auth_procedure(imsi, ki):
 
 def nas_smc_procedure():
     print("\n--- NAS Security Mode Command ---")
-    print_s1ap_log("downlinkNASTransport",
-                   NAS_Message="Security Mode Command",
-                   Ciphering="AES128",
-                   Integrity="NIA2")
+    print_s1ap_log("downlinkNASTransport", NAS_Message="Security Mode Command", Ciphering="AES128", Integrity="NIA2")
     print("[+] Security Mode Complete")
-    print_s1ap_log("uplinkNASTransport",
-                   NAS_Message="Security Mode Complete")
+    print_s1ap_log("uplinkNASTransport", NAS_Message="Security Mode Complete")
 
 def add_subscriber():
     msisdn = input("Paste nomor HP: ").strip()
@@ -174,8 +192,8 @@ def add_subscriber():
         ki = c.fetchone()[0]
 
         loading("Selecting target cell")
-        c.execute("SELECT cell_id, location, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
-        cell_id, location, tac, city = c.fetchone()
+        c.execute("SELECT cell_id, location, address, sector, azimuth, tac, city, latitude, longitude FROM cell ORDER BY RANDOM() LIMIT 1")
+        cell_id, location, address, sector, azimuth, tac, city, lat, lon = c.fetchone()
 
         rand, xres, kasme = nas_auth_procedure(imsi, ki)
         if not rand:
@@ -192,14 +210,20 @@ def add_subscriber():
         print(f"\n[+] Attach Success!")
         print(f" MSISDN : {msisdn}")
         print(f" IMSI : {imsi}")
-        print(f" PLMN-ID: {MCC_MNC[:3]} {MCC_MNC[3:]}")
+        print(f" PLMN-ID : {MCC_MNC[:3]} {MCC_MNC[3:]}")
         print(f" Cell ID : {cell_id}")
-        print(f" Location: {city} - {location}")
+        print(f" Site : {location}")
+        print(f" Sector : {sector} | Azimuth: {azimuth}°")
+        print(f" Address : {address}")
+        print(f" Location : {city} | Lat: {lat}, Lon: {lon}")
+
         print_s1ap_log("initialUEMessage",
                        IMSI=imsi,
                        PLMN_ID=f"{MCC_MNC[:3]} {MCC_MNC[3:]}",
                        TAC=tac,
                        CellID=cell_id,
+                       Sector=sector,
+                       Azimuth=azimuth,
                        S_TMSI=s_tmsi)
 
     except sqlite3.IntegrityError:
@@ -237,8 +261,8 @@ def handover():
         conn.close()
         return
     imsi = row[0]
-    c.execute("SELECT cell_id, location, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
-    new_cell, new_loc, new_tac, new_city = c.fetchone()
+    c.execute("SELECT cell_id, location, address, sector, azimuth, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
+    new_cell, new_loc, new_addr, new_sec, new_azi, new_tac, new_city = c.fetchone()
     loading("Executing handover")
     c.execute("UPDATE session SET end_time = CURRENT_TIMESTAMP WHERE imsi =? AND end_time IS NULL", (imsi,))
     c.execute("INSERT INTO session (imsi, cell_id, s_tmsi, rand, xres, kasme) VALUES (?,?,?,?,?,?)",
@@ -250,14 +274,16 @@ def handover():
                    IMSI=imsi,
                    PLMN_ID=f"{MCC_MNC[:3]} {MCC_MNC[3:]}",
                    TargetCell=new_cell,
-                   TAC=new_tac,
+                   Sector=new_sec,
+                   Azimuth=new_azi,
+                   Address=new_addr,
                    City=new_city)
 
 def show_all():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute('''SELECT s.msisdn, s.imsi, s.status, c.city, c.location, c.tac,
-                        se.cell_id, se.s_tmsi, se.start_time
+    c.execute('''SELECT s.msisdn, s.imsi, s.status, c.city, c.location, c.address,
+                        c.sector, c.azimuth, c.tac, se.cell_id, se.s_tmsi, se.start_time
                  FROM session se
                  JOIN subscriber s ON se.imsi = s.imsi
                  JOIN cell c ON se.cell_id = c.cell_id
@@ -266,10 +292,10 @@ def show_all():
     rows = c.fetchall()
     conn.close()
     print(f"\n=== Active Sessions - PLMN {MCC_MNC[:3]} {MCC_MNC[3:]} ===")
-    print(f"{'MSISDN':<15} {'IMSI':<15} {'Status':<9} {'City':<12} {'Location':<18} {'TAC':<6} {'Cell':<9} {'S-TMSI'}")
-    print("-"*110)
+    print(f"{'MSISDN':<15} {'IMSI':<15} {'City':<10} {'Site':<12} {'Sec':<4} {'Azi':<5} {'Address'}")
+    print("-"*120)
     for row in rows:
-        print(f"{row[0]:<15} {row[1]:<15} {row[2]:<9} {row[3]:<12} {row[4]:<18} {row[5]:<6} {row[6]:<9} {row[7]}")
+        print(f"{row[0]:<15} {row[1]:<15} {row[3]:<10} {row[4]:<12} S{row[6]:<3} {row[7]}° {row[5]}")
 
 def city_menu():
     print("\n=== Pilih Kota untuk Generate Cell ===")
