@@ -9,8 +9,14 @@ import hashlib
 import hmac
 
 DB = 'core.db'
-MCC_MNC = "51010" # Indonesia Telkomsel dummy
-K_KEY = "1234567890ABCDEF1234567890ABCDEF" # Dummy Ki key subscriber
+
+OPERATORS = {
+    "1": {"name": "Telkomsel", "mcc_mnc": "51010"},
+    "2": {"name": "Indosat", "mcc_mnc": "51001"},
+    "3": {"name": "XL Axiata", "mcc_mnc": "51011"},
+    "4": {"name": "Smartfren", "mcc_mnc": "51009"},
+    "5": {"name": "Tri", "mcc_mnc": "51089"}
+}
 
 BASE_COORDS = {
     "Jakarta": (-6.2000, 106.8166),
@@ -20,12 +26,24 @@ BASE_COORDS = {
     "Semarang": (-6.9667, 110.4167)
 }
 
+MCC_MNC = "51010" # Default, bakal di-override pas startup
+K_KEY = "1234567890ABCDEF1234567890ABCDEF" # Dummy Ki key
+
 def loading(msg="Processing"):
     print(f"{msg}", end="", flush=True)
     for _ in range(3):
         time.sleep(0.3)
         print(".", end="", flush=True)
     print(" Done!")
+
+def select_operator():
+    print("\n=== Pilih Operator ===")
+    for k, v in OPERATORS.items():
+        print(f"{k}. {v['name']} - {v['mcc_mnc']}")
+    choice = input("Pilih: ")
+    op = OPERATORS.get(choice, OPERATORS["1"])
+    print(f"[+] Operator terpilih: {op['name']} [{op['mcc_mnc']}]")
+    return op['mcc_mnc']
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -91,7 +109,6 @@ def generate_s_tmsi(imsi):
     return "0x" + h[:8].upper()
 
 def milenage(ki, rand):
-    # Simulasi sederhana fungsi autentikasi EPS AKA
     xres = hmac.new(bytes.fromhex(ki), bytes.fromhex(rand), hashlib.md5).hexdigest()[:16]
     kasme = hmac.new(bytes.fromhex(ki), bytes.fromhex(rand + xres), hashlib.sha256).hexdigest()[:32]
     return xres, kasme
@@ -116,7 +133,7 @@ def nas_auth_procedure(imsi, ki):
 
     res = input("Masukkan RES [enter untuk auto-OK]: ").strip()
     if not res:
-        res = xres # auto success
+        res = xres
 
     if res == xres:
         print("[+] Authentication Success")
@@ -160,16 +177,13 @@ def add_subscriber():
         c.execute("SELECT cell_id, location, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
         cell_id, location, tac, city = c.fetchone()
 
-        # 1. Authentication
         rand, xres, kasme = nas_auth_procedure(imsi, ki)
         if not rand:
             print("[-] Attach rejected: Auth failed")
             return
 
-        # 2. Security Mode Command
         nas_smc_procedure()
 
-        # 3. Create session
         loading("Creating session")
         c.execute("INSERT INTO session (imsi, cell_id, s_tmsi, rand, xres, kasme) VALUES (?,?,?,?,?,?)",
                   (imsi, cell_id, s_tmsi, rand, xres, kasme))
@@ -178,10 +192,12 @@ def add_subscriber():
         print(f"\n[+] Attach Success!")
         print(f" MSISDN : {msisdn}")
         print(f" IMSI : {imsi}")
+        print(f" PLMN-ID: {MCC_MNC[:3]} {MCC_MNC[3:]}")
         print(f" Cell ID : {cell_id}")
         print(f" Location: {city} - {location}")
         print_s1ap_log("initialUEMessage",
                        IMSI=imsi,
+                       PLMN_ID=f"{MCC_MNC[:3]} {MCC_MNC[3:]}",
                        TAC=tac,
                        CellID=cell_id,
                        S_TMSI=s_tmsi)
@@ -232,6 +248,7 @@ def handover():
     print(f"[+] Handover success!")
     print_s1ap_log("handoverNotification",
                    IMSI=imsi,
+                   PLMN_ID=f"{MCC_MNC[:3]} {MCC_MNC[3:]}",
                    TargetCell=new_cell,
                    TAC=new_tac,
                    City=new_city)
@@ -248,7 +265,7 @@ def show_all():
                  ORDER BY se.start_time DESC LIMIT 100''')
     rows = c.fetchall()
     conn.close()
-    print("\n=== Active Sessions ===")
+    print(f"\n=== Active Sessions - PLMN {MCC_MNC[:3]} {MCC_MNC[3:]} ===")
     print(f"{'MSISDN':<15} {'IMSI':<15} {'Status':<9} {'City':<12} {'Location':<18} {'TAC':<6} {'Cell':<9} {'S-TMSI'}")
     print("-"*110)
     for row in rows:
@@ -272,9 +289,11 @@ def city_menu():
         print("[-] Pilihan tidak valid")
 
 def main():
+    global MCC_MNC
+    MCC_MNC = select_operator()
     init_db()
     while True:
-        print("\n=== core-net-lite by sdev ===")
+        print(f"\n=== core-net-lite by sdev | Operator: {MCC_MNC} ===")
         print("1. Attach Subscriber")
         print("2. Detach Subscriber")
         print("3. Handover")
