@@ -6,9 +6,11 @@ import sqlite3
 import random
 import time
 import hashlib
+import hmac
 
 DB = 'core.db'
 MCC_MNC = "51010" # Indonesia Telkomsel dummy
+K_KEY = "1234567890ABCDEF1234567890ABCDEF" # Dummy Ki key subscriber
 
 BASE_COORDS = {
     "Jakarta": (-6.2000, 106.8166),
@@ -31,6 +33,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS subscriber (
         imsi TEXT PRIMARY KEY,
         msisdn TEXT UNIQUE NOT NULL,
+        ki TEXT NOT NULL,
         status TEXT DEFAULT 'ACTIVE'
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS cell (
@@ -46,16 +49,16 @@ def init_db():
         imsi TEXT NOT NULL,
         cell_id TEXT NOT NULL,
         s_tmsi TEXT,
+        rand TEXT,
+        xres TEXT,
+        kasme TEXT,
         start_time TEXT DEFAULT CURRENT_TIMESTAMP,
         end_time TEXT,
         FOREIGN KEY(imsi) REFERENCES subscriber(imsi),
         FOREIGN KEY(cell_id) REFERENCES cell(cell_id)
     )''')
-
-    # Index biar query cepet kalau data udah banyak
     c.execute("CREATE INDEX IF NOT EXISTS idx_imsi ON session(imsi)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_city ON cell(city)")
-
     conn.commit()
     conn.close()
 
@@ -63,13 +66,10 @@ def seed_cells_kota(kota="Jakarta", n=150):
     if kota not in BASE_COORDS:
         print(f"[-] Kota {kota} belum ada di database")
         return
-
     lat0, lon0 = BASE_COORDS[kota]
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-
     c.execute("DELETE FROM cell WHERE city =?", (kota,))
-
     cells = []
     for i in range(1, n+1):
         cell_id = f"{kota[:3].upper()}{i:03d}"
@@ -78,7 +78,6 @@ def seed_cells_kota(kota="Jakarta", n=150):
         tac = f"01{random.randint(0xA0, 0xFF):X}"
         location = f"{kota} Area {i}"
         cells.append((cell_id, kota, location, tac, lat, lon))
-
     c.executemany("INSERT INTO cell VALUES (?,?,?,?,?,?)", cells)
     conn.commit()
     conn.close()
@@ -91,28 +90,53 @@ def generate_s_tmsi(imsi):
     h = hashlib.md5(imsi.encode()).hexdigest()
     return "0x" + h[:8].upper()
 
-def print_s1ap_log(event, imsi, cell_id, tac, location, city, s_tmsi=None):
+def milenage(ki, rand):
+    # Simulasi sederhana fungsi autentikasi EPS AKA
+    xres = hmac.new(bytes.fromhex(ki), bytes.fromhex(rand), hashlib.md5).hexdigest()[:16]
+    kasme = hmac.new(bytes.fromhex(ki), bytes.fromhex(rand + xres), hashlib.sha256).hexdigest()[:32]
+    return xres, kasme
+
+def print_s1ap_log(event, **kwargs):
     print("\n[S1AP Message]")
     print(f" Procedure Code: id-{event}")
     print(f" protocolIEs:")
-    print(f" Item 0: id-eNB-UE-S1AP-ID")
-    print(f" eNB-UE-S1AP-ID: 0x{random.randint(1, 9999):04X}")
-    print(f" Item 1: id-IMSI")
-    print(f" IMSI: {imsi}")
-    print(f" Item 2: id-TAI")
-    print(f" TAI")
-    print(f" plmn-ID: {MCC_MNC[:3]} {MCC_MNC[3:]}")
-    print(f" TAC: 0x{tac}")
-    print(f" Item 3: id-EUTRAN-CGI")
-    print(f" EUTRAN-CGI")
-    print(f" plmn-ID: {MCC_MNC[:3]} {MCC_MNC[3:]}")
-    print(f" cell-ID: {cell_id}")
-    print(f" Item 4: id-Location")
-    print(f" City: {city}, Location: {location}")
-    if s_tmsi:
-        print(f" Item 5: id-S-TMSI")
-        print(f" S-TMSI: {s_tmsi}")
+    for i, (k, v) in enumerate(kwargs.items(), 0):
+        print(f" Item {i}: id-{k}")
+        print(f" {k}: {v}")
     print("[/S1AP]\n")
+
+def nas_auth_procedure(imsi, ki):
+    print("\n--- NAS Authentication Procedure ---")
+    rand = format(random.getrandbits(128), '032x').upper()
+    xres, kasme = milenage(ki, rand)
+
+    print_s1ap_log("downlinkNASTransport",
+                   NAS_Message="Authentication Request",
+                   RAND=rand)
+
+    res = input("Masukkan RES [enter untuk auto-OK]: ").strip()
+    if not res:
+        res = xres # auto success
+
+    if res == xres:
+        print("[+] Authentication Success")
+        print_s1ap_log("uplinkNASTransport",
+                       NAS_Message="Authentication Response",
+                       RES=res)
+        return rand, xres, kasme
+    else:
+        print("[-] Authentication Failed")
+        return None, None, None
+
+def nas_smc_procedure():
+    print("\n--- NAS Security Mode Command ---")
+    print_s1ap_log("downlinkNASTransport",
+                   NAS_Message="Security Mode Command",
+                   Ciphering="AES128",
+                   Integrity="NIA2")
+    print("[+] Security Mode Complete")
+    print_s1ap_log("uplinkNASTransport",
+                   NAS_Message="Security Mode Complete")
 
 def add_subscriber():
     msisdn = input("Paste nomor HP: ").strip()
@@ -127,14 +151,28 @@ def add_subscriber():
     c = conn.cursor()
     try:
         loading("Registering subscriber")
-        c.execute("INSERT INTO subscriber (imsi, msisdn) VALUES (?,?)", (imsi, msisdn))
+        c.execute("INSERT OR IGNORE INTO subscriber (imsi, msisdn, ki) VALUES (?,?,?)", (imsi, msisdn, K_KEY))
+
+        c.execute("SELECT ki FROM subscriber WHERE imsi =?", (imsi,))
+        ki = c.fetchone()[0]
 
         loading("Selecting target cell")
         c.execute("SELECT cell_id, location, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
         cell_id, location, tac, city = c.fetchone()
 
+        # 1. Authentication
+        rand, xres, kasme = nas_auth_procedure(imsi, ki)
+        if not rand:
+            print("[-] Attach rejected: Auth failed")
+            return
+
+        # 2. Security Mode Command
+        nas_smc_procedure()
+
+        # 3. Create session
         loading("Creating session")
-        c.execute("INSERT INTO session (imsi, cell_id, s_tmsi) VALUES (?,?,?)", (imsi, cell_id, s_tmsi))
+        c.execute("INSERT INTO session (imsi, cell_id, s_tmsi, rand, xres, kasme) VALUES (?,?,?,?,?,?)",
+                  (imsi, cell_id, s_tmsi, rand, xres, kasme))
         conn.commit()
 
         print(f"\n[+] Attach Success!")
@@ -142,7 +180,11 @@ def add_subscriber():
         print(f" IMSI : {imsi}")
         print(f" Cell ID : {cell_id}")
         print(f" Location: {city} - {location}")
-        print_s1ap_log("initialUEMessage", imsi, cell_id, tac, location, city, s_tmsi)
+        print_s1ap_log("initialUEMessage",
+                       IMSI=imsi,
+                       TAC=tac,
+                       CellID=cell_id,
+                       S_TMSI=s_tmsi)
 
     except sqlite3.IntegrityError:
         print("[-] Nomor ini udah ada di database")
@@ -155,12 +197,10 @@ def detach_subscriber():
     c = conn.cursor()
     c.execute("SELECT imsi FROM subscriber WHERE msisdn =?", (msisdn,))
     row = c.fetchone()
-
     if not row:
         print("[-] Nomor tidak ditemukan")
         conn.close()
         return
-
     imsi = row[0]
     loading("Detaching subscriber")
     c.execute("UPDATE session SET end_time = CURRENT_TIMESTAMP WHERE imsi =? AND end_time IS NULL", (imsi,))
@@ -168,7 +208,7 @@ def detach_subscriber():
     conn.commit()
     conn.close()
     print(f"[+] Subscriber {msisdn} berhasil di-detach")
-    print_s1ap_log("UEContextRelease", imsi, "-", "-")
+    print_s1ap_log("UEContextRelease", Cause="User Detach", IMSI=imsi)
 
 def handover():
     msisdn = input("Masukkan nomor HP yang mau handover: ").strip()
@@ -176,42 +216,43 @@ def handover():
     c = conn.cursor()
     c.execute("SELECT imsi FROM subscriber WHERE msisdn =? AND status = 'ACTIVE'", (msisdn,))
     row = c.fetchone()
-
     if not row:
         print("[-] Nomor tidak aktif atau tidak ditemukan")
         conn.close()
         return
-
     imsi = row[0]
     c.execute("SELECT cell_id, location, tac, city FROM cell ORDER BY RANDOM() LIMIT 1")
     new_cell, new_loc, new_tac, new_city = c.fetchone()
-
     loading("Executing handover")
     c.execute("UPDATE session SET end_time = CURRENT_TIMESTAMP WHERE imsi =? AND end_time IS NULL", (imsi,))
-    c.execute("INSERT INTO session (imsi, cell_id, s_tmsi) VALUES (?,?,?)",
-              (imsi, new_cell, generate_s_tmsi(imsi + str(random.randint(1,999)))))
+    c.execute("INSERT INTO session (imsi, cell_id, s_tmsi, rand, xres, kasme) VALUES (?,?,?,?,?,?)",
+              (imsi, new_cell, generate_s_tmsi(imsi + str(random.randint(1,999))), None, None, None))
     conn.commit()
     conn.close()
     print(f"[+] Handover success!")
-    print_s1ap_log("handoverNotification", imsi, new_cell, new_tac, new_loc, new_city)
+    print_s1ap_log("handoverNotification",
+                   IMSI=imsi,
+                   TargetCell=new_cell,
+                   TAC=new_tac,
+                   City=new_city)
 
 def show_all():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute('''SELECT s.msisdn, s.imsi, s.status, c.city, c.location, c.tac, c.latitude, c.longitude,
-                        se.cell_id, se.s_tmsi, se.start_time, se.end_time
+    c.execute('''SELECT s.msisdn, s.imsi, s.status, c.city, c.location, c.tac,
+                        se.cell_id, se.s_tmsi, se.start_time
                  FROM session se
                  JOIN subscriber s ON se.imsi = s.imsi
                  JOIN cell c ON se.cell_id = c.cell_id
+                 WHERE se.end_time IS NULL
                  ORDER BY se.start_time DESC LIMIT 100''')
     rows = c.fetchall()
     conn.close()
-
-    print("\n=== Session Log (Last 100) ===")
-    print(f"{'MSISDN':<15} {'IMSI':<15} {'Status':<9} {'City':<12} {'Location':<18} {'TAC':<6} {'Cell':<9} {'S-TMSI':<12} {'Start'}")
-    print("-"*125)
+    print("\n=== Active Sessions ===")
+    print(f"{'MSISDN':<15} {'IMSI':<15} {'Status':<9} {'City':<12} {'Location':<18} {'TAC':<6} {'Cell':<9} {'S-TMSI'}")
+    print("-"*110)
     for row in rows:
-        print(f"{row[0]:<15} {row[1]:<15} {row[2]:<9} {row[3]:<12} {row[4]:<18} {row[5]:<6} {row[8]:<9} {row[9]:<12} {row[10]}")
+        print(f"{row[0]:<15} {row[1]:<15} {row[2]:<9} {row[3]:<12} {row[4]:<18} {row[5]:<6} {row[6]:<9} {row[7]}")
 
 def city_menu():
     print("\n=== Pilih Kota untuk Generate Cell ===")
@@ -219,7 +260,6 @@ def city_menu():
         print(f"{i}. {kota}")
     print("6. Kembali")
     choice = input("Pilih: ")
-
     kota_list = list(BASE_COORDS.keys())
     if choice.isdigit() and 1 <= int(choice) <= len(kota_list):
         kota = kota_list[int(choice)-1]
@@ -238,11 +278,10 @@ def main():
         print("1. Attach Subscriber")
         print("2. Detach Subscriber")
         print("3. Handover")
-        print("4. Lihat Semua Data")
+        print("4. Lihat Active Sessions")
         print("5. Generate Cell per Kota")
         print("6. Keluar")
         choice = input("Pilih: ")
-
         if choice == '1':
             add_subscriber()
         elif choice == '2':
