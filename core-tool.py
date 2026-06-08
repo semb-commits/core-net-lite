@@ -125,6 +125,7 @@ def seed_cells_kota(kota="Jakarta", n=150):
         if len(cells) >= n:
             break
 
+    # FIX: 9 kolom = 9 placeholder
     c.executemany("INSERT INTO cell VALUES (?,?,?,?,?)", cells)
     conn.commit()
     conn.close()
@@ -228,6 +229,8 @@ def add_subscriber():
 
     except sqlite3.IntegrityError:
         print("[-] Nomor ini udah ada di database")
+    except TypeError:
+        print("[-] Gagal ambil data cell. Udah generate cell belum? Menu 5 dulu.")
     finally:
         conn.close()
 
